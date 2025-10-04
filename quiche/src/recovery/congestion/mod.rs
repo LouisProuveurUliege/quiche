@@ -293,6 +293,7 @@ impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {
             // LegacyRecovery never gets a RecoveryConfig with the
             // Bbr2Gcongestion algorithm.
             CongestionControlAlgorithm::Bbr2Gcongestion => unreachable!(),
+            CongestionControlAlgorithm::NOOP => &nocc::NOCC,
         }
     }
 }
@@ -351,6 +352,7 @@ mod tests {
 }
 
 mod cubic;
+mod nocc;
 mod delivery_rate;
 mod hystart;
 mod prr;

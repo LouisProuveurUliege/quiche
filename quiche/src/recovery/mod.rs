@@ -379,6 +379,8 @@ pub enum CongestionControlAlgorithm {
     /// BBRv2 congestion control algorithm implementation from gcongestion
     /// branch. `bbr2_gcongestion` in a string form.
     Bbr2Gcongestion = 4,
+    /// Noop congestion control algorithm. `noop`is a string form.
+    NOOP = 5,
 }
 
 impl FromStr for CongestionControlAlgorithm {
@@ -392,6 +394,7 @@ impl FromStr for CongestionControlAlgorithm {
             "reno" => Ok(CongestionControlAlgorithm::Reno),
             "cubic" => Ok(CongestionControlAlgorithm::CUBIC),
             "bbr" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
+            "noop" => Ok(CongestionControlAlgorithm::NOOP),
             "bbr2" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             "bbr2_gcongestion" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             _ => Err(crate::Error::CongestionControl),

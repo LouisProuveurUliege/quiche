@@ -59,6 +59,12 @@ pub struct QuicSettings {
     #[serde(default = "QuicSettings::default_dgram_max_queue_len")]
     pub dgram_send_max_queue_len: usize,
 
+    /// Initial RTT
+    /// 
+    /// Defaults to 333
+    #[serde(default = "QuicSettings::default_initial_rtt")]
+    pub initial_rtt: Duration,
+
     /// Configures whether to enable early data (0-RTT) support. Currently only
     /// supported for servers.
     ///
@@ -342,6 +348,11 @@ impl QuicSettings {
     #[inline]
     fn default_dgram_max_queue_len() -> usize {
         65536
+    }
+
+    #[inline]
+    fn default_initial_rtt() -> Duration {
+        Duration::from_millis(333)
     }
 
     #[inline]

@@ -36,7 +36,7 @@ pub mod connection_summary;
 pub mod sync_client;
 
 use connection_summary::*;
-use qlog::events::h3::HttpHeader;
+use qlog::events::http3::HttpHeader;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -53,8 +53,8 @@ use crate::frame_parser::FrameParser;
 use crate::frame_parser::InterruptCause;
 use crate::recordreplay::qlog::QlogEvent;
 use crate::recordreplay::qlog::*;
-use qlog::events::h3::H3FrameParsed;
-use qlog::events::h3::Http3Frame;
+use qlog::events::http3::H3FrameParsed;
+use qlog::events::http3::Http3Frame;
 use qlog::events::EventData;
 use qlog::streamer::QlogStreamer;
 use serde::Serialize;
@@ -105,8 +105,8 @@ pub(crate) trait Client {
 
 pub(crate) type StreamParserMap = HashMap<u64, FrameParser>;
 
-pub(crate) fn execute_action(
-    action: &Action, conn: &mut quiche::Connection,
+pub(crate) fn execute_action<F: quiche::BufFactory>(
+    action: &Action, conn: &mut quiche::Connection<F>,
     stream_parsers: &mut StreamParserMap,
 ) {
     match action {
@@ -139,7 +139,7 @@ pub(crate) fn execute_action(
                             // need to rewrite the event time
                             ev.time = Instant::now()
                                 .duration_since(s.start_time())
-                                .as_secs_f32() *
+                                .as_secs_f64() *
                                 1000.0;
                             s.add_event(ev).ok();
                         },
@@ -190,7 +190,7 @@ pub(crate) fn execute_action(
                             // need to rewrite the event time
                             ev.time = Instant::now()
                                 .duration_since(s.start_time())
-                                .as_secs_f32() *
+                                .as_secs_f64() *
                                 1000.0;
                             s.add_event(ev).ok();
                         },
@@ -316,8 +316,8 @@ pub(crate) fn execute_action(
     }
 }
 
-pub(crate) fn parse_streams<C: Client>(
-    conn: &mut quiche::Connection, client: &mut C,
+pub(crate) fn parse_streams<F: quiche::BufFactory, C: Client>(
+    conn: &mut quiche::Connection<F>, client: &mut C,
 ) -> Vec<StreamEvent> {
     let mut responded_streams: Vec<StreamEvent> =
         Vec::with_capacity(conn.readable().len());
@@ -456,7 +456,7 @@ fn handle_response_frame<C: Client>(
             let qlog_headers: Vec<HttpHeader> = enriched_headers
                 .headers()
                 .iter()
-                .map(|h| qlog::events::h3::HttpHeader {
+                .map(|h| qlog::events::http3::HttpHeader {
                     name: String::from_utf8_lossy(h.name()).into_owned(),
                     value: String::from_utf8_lossy(h.value()).into_owned(),
                 })

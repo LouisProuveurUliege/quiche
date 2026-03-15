@@ -419,7 +419,7 @@ use qlog::events::RawInfo;
 
 use smallvec::SmallVec;
 
-use crate::range_buf::DefaultBufFactory;
+use crate::buffers::DefaultBufFactory;
 
 use crate::recovery::OnAckReceivedOutcome;
 use crate::recovery::OnLossDetectionTimeoutOutcome;
@@ -576,6 +576,8 @@ pub struct Config {
     custom_bbr_params: Option<BbrParams>,
     initial_congestion_window_packets: usize,
     enable_relaxed_loss_threshold: bool,
+    enable_cubic_idle_restart_fix: bool,
+    enable_send_streams_blocked: bool,
 
     pmtud: bool,
     pmtud_max_probes: u8,
@@ -656,6 +658,8 @@ impl Config {
             initial_congestion_window_packets:
                 DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
             enable_relaxed_loss_threshold: false,
+            enable_cubic_idle_restart_fix: true,
+            enable_send_streams_blocked: false,
             pmtud: false,
             pmtud_max_probes: pmtud::MAX_PROBES_DEFAULT,
             hystart: true,
@@ -1122,6 +1126,28 @@ impl Config {
         self.enable_relaxed_loss_threshold = enable;
     }
 
+    /// Configure whether to enable the CUBIC idle restart fix.
+    ///
+    /// When enabled, the epoch shift on idle restart uses the later of
+    /// the last ACK time and last send time, avoiding an inflated delta
+    /// when bytes-in-flight transiently hits zero.
+    ///
+    /// The default value is `true`.
+    pub fn set_enable_cubic_idle_restart_fix(&mut self, enable: bool) {
+        self.enable_cubic_idle_restart_fix = enable;
+    }
+
+    /// Configure whether to enable sending STREAMS_BLOCKED frames.
+    ///
+    /// STREAMS_BLOCKED frames are an optional advisory signal in the QUIC
+    /// protocol which SHOULD be sent when the sender wishes to open a stream
+    /// but is unable to do so due to the maximum stream limit set by its peer.
+    ///
+    /// The default value is false.
+    pub fn set_enable_send_streams_blocked(&mut self, enable: bool) {
+        self.enable_send_streams_blocked = enable;
+    }
+
     /// Configures whether to enable HyStart++.
     ///
     /// The default value is `true`.
@@ -1232,6 +1258,42 @@ pub enum TxBufferTrackingState {
     /// connection stalls or excess buffering due to bugs we haven't
     /// tracked down yet.
     Inconsistent,
+}
+
+/// Tracks if the connection hit the peer stream limit and which
+/// STREAMS_BLOCKED frames have been sent.
+#[derive(Default)]
+struct StreamsBlockedState {
+    /// The peer's max_streams limit at which we last became blocked on
+    /// opening new local streams, if any.
+    blocked_at: Option<u64>,
+
+    /// The stream limit sent on the most recently sent STREAMS_BLOCKED
+    /// frame. If != to blocked_at, the connection has pending STREAMS_BLOCKED
+    /// frames to send.
+    blocked_sent: Option<u64>,
+}
+
+impl StreamsBlockedState {
+    /// Returns true if there is a STREAMS_BLOCKED frame that needs sending.
+    fn has_pending_stream_blocked_frame(&self) -> bool {
+        self.blocked_sent < self.blocked_at
+    }
+
+    /// Update the stream blocked limit.
+    fn update_at(&mut self, limit: u64) {
+        self.blocked_at = self.blocked_at.max(Some(limit));
+    }
+
+    /// Clear blocked_sent to force retransmission of the most recently sent
+    /// STREAMS_BLOCKED frame.
+    fn force_retransmit_sent_limit_eq(&mut self, limit: u64) {
+        // Only clear blocked_sent if the lost frame had the most recently sent
+        // limit.
+        if self.blocked_sent == Some(limit) {
+            self.blocked_sent = None;
+        }
+    }
 }
 
 /// A QUIC connection.
@@ -1456,6 +1518,10 @@ where
     /// Whether to send GREASE.
     grease: bool,
 
+    /// Whether to send STREAMS_BLOCKED frames when bidi or uni stream quota
+    /// exhausted.
+    enable_send_streams_blocked: bool,
+
     /// TLS keylog writer.
     keylog: Option<Box<dyn std::io::Write + Send + Sync>>,
 
@@ -1499,6 +1565,19 @@ where
     /// The number of STREAM_DATA_BLOCKED frames received from the remote
     /// endpoint.
     stream_data_blocked_recv_count: u64,
+
+    /// The number of STREAMS_BLOCKED frames received from the remote endpoint
+    /// indicating the peer is blocked on opening new bidirectional streams.
+    streams_blocked_bidi_recv_count: u64,
+
+    /// The number of STREAMS_BLOCKED frames received from the remote endpoint
+    /// indicating the peer is blocked on opening new unidirectional streams.
+    streams_blocked_uni_recv_count: u64,
+
+    /// Tracks if the connection hit the peer's bidi or uni stream limit, and if
+    /// STREAMS_BLOCKED frames are pending transmission.
+    streams_blocked_bidi_state: StreamsBlockedState,
+    streams_blocked_uni_state: StreamsBlockedState,
 
     /// The anti-amplification limit factor.
     max_amplification_factor: usize,
@@ -2091,6 +2170,8 @@ impl<F: BufFactory> Connection<F> {
 
             grease: config.grease,
 
+            enable_send_streams_blocked: config.enable_send_streams_blocked,
+
             keylog: None,
 
             #[cfg(feature = "qlog")]
@@ -2117,6 +2198,12 @@ impl<F: BufFactory> Connection<F> {
             stream_data_blocked_sent_count: 0,
             data_blocked_recv_count: 0,
             stream_data_blocked_recv_count: 0,
+
+            streams_blocked_bidi_recv_count: 0,
+            streams_blocked_uni_recv_count: 0,
+
+            streams_blocked_bidi_state: Default::default(),
+            streams_blocked_uni_state: Default::default(),
 
             max_amplification_factor: config.max_amplification_factor,
         };
@@ -2433,6 +2520,27 @@ impl<F: BufFactory> Connection<F> {
         let ex_data = tls::ExData::from_ssl_ref(ssl).ok_or(Error::TlsFail)?;
 
         ex_data.recovery_config.enable_relaxed_loss_threshold = enable;
+
+        Ok(())
+    }
+
+    /// Configure whether to enable the CUBIC idle restart fix.
+    ///
+    /// This function can only be called inside one of BoringSSL's handshake
+    /// callbacks, before any packet has been sent. Calling this function any
+    /// other time will have no effect.
+    ///
+    /// See [`Config::set_enable_cubic_idle_restart_fix()`].
+    ///
+    /// [`Config::set_enable_cubic_idle_restart_fix()`]: struct.Config.html#method.set_enable_cubic_idle_restart_fix
+    #[cfg(feature = "boringssl-boring-crate")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "boringssl-boring-crate")))]
+    pub fn set_enable_cubic_idle_restart_fix_in_handshake(
+        ssl: &mut boring::ssl::SslRef, enable: bool,
+    ) -> Result<()> {
+        let ex_data = tls::ExData::from_ssl_ref(ssl).ok_or(Error::TlsFail)?;
+
+        ex_data.recovery_config.enable_cubic_idle_restart_fix = enable;
 
         Ok(())
     }
@@ -4113,6 +4221,21 @@ impl<F: BufFactory> Connection<F> {
                         self.should_send_max_streams_bidi = true;
                     },
 
+                    // Retransmit STREAMS_BLOCKED frames if the frame with the
+                    // most recent limit is lost.  These are informational
+                    // signals to the peer, reliably sending them
+                    // ensures the signal is used consistently and helps
+                    // debugging.
+                    frame::Frame::StreamsBlockedBidi { limit } => {
+                        self.streams_blocked_bidi_state
+                            .force_retransmit_sent_limit_eq(limit);
+                    },
+
+                    frame::Frame::StreamsBlockedUni { limit } => {
+                        self.streams_blocked_uni_state
+                            .force_retransmit_sent_limit_eq(limit);
+                    },
+
                     frame::Frame::NewConnectionId { seq_num, .. } => {
                         self.ids.mark_advertise_new_scid_seq(seq_num, true);
                     },
@@ -4529,6 +4652,49 @@ impl<F: BufFactory> Connection<F> {
 
                     ack_eliciting = true;
                     in_flight = true;
+                }
+            }
+
+            // Create STREAMS_BLOCKED (bidi) frame when the local endpoint has
+            // exhausted the peer's bidirectional stream count limit.
+            if self
+                .streams_blocked_bidi_state
+                .has_pending_stream_blocked_frame()
+            {
+                if let Some(limit) = self.streams_blocked_bidi_state.blocked_at {
+                    let frame = frame::Frame::StreamsBlockedBidi { limit };
+
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        // Record the limit we just notified the peer about so
+                        // that redundant frames for the same limit are
+                        // suppressed.
+                        self.streams_blocked_bidi_state.blocked_sent =
+                            Some(limit);
+
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
+                }
+            }
+
+            // Create STREAMS_BLOCKED (uni) frame when the local endpoint has
+            // exhausted the peer's unidirectional stream count limit.
+            if self
+                .streams_blocked_uni_state
+                .has_pending_stream_blocked_frame()
+            {
+                if let Some(limit) = self.streams_blocked_uni_state.blocked_at {
+                    let frame = frame::Frame::StreamsBlockedUni { limit };
+
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        // Record the limit we just notified the peer about so
+                        // that redundant frames for the same limit are
+                        // suppressed.
+                        self.streams_blocked_uni_state.blocked_sent = Some(limit);
+
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
                 }
             }
 
@@ -5123,7 +5289,7 @@ impl<F: BufFactory> Connection<F> {
                 };
 
                 let send_at_time =
-                    now.duration_since(q.start_time()).as_secs_f32() * 1000.0;
+                    now.duration_since(q.start_time()).as_secs_f64() * 1000.0;
 
                 let ev_data =
                     EventData::PacketSent(qlog::events::quic::PacketSent {
@@ -5139,7 +5305,7 @@ impl<F: BufFactory> Connection<F> {
         });
 
         let aead = match crypto_ctx.crypto_seal {
-            Some(ref v) => v,
+            Some(ref mut v) => v,
             None => return Err(Error::InvalidState),
         };
 
@@ -5633,7 +5799,30 @@ impl<F: BufFactory> Connection<F> {
         let cap = self.tx_cap;
 
         // Get existing stream or create a new one.
-        let stream = self.get_or_create_stream(stream_id, true)?;
+        let stream = match self.get_or_create_stream(stream_id, true) {
+            Ok(v) => v,
+
+            Err(Error::StreamLimit) => {
+                // If the local endpoint has exhausted the peer's stream count
+                // limit, record the current limit so that a STREAMS_BLOCKED
+                // frame can be sent.
+                if self.enable_send_streams_blocked &&
+                    stream::is_local(stream_id, self.is_server)
+                {
+                    if stream::is_bidi(stream_id) {
+                        let limit = self.streams.peer_max_streams_bidi();
+                        self.streams_blocked_bidi_state.update_at(limit);
+                    } else {
+                        let limit = self.streams.peer_max_streams_uni();
+                        self.streams_blocked_uni_state.update_at(limit);
+                    }
+                }
+
+                return Err(Error::StreamLimit);
+            },
+
+            Err(e) => return Err(e),
+        };
 
         #[cfg(feature = "qlog")]
         let offset = stream.send.off_back();
@@ -7424,6 +7613,8 @@ impl<F: BufFactory> Connection<F> {
             stream_data_blocked_sent_count: self.stream_data_blocked_sent_count,
             data_blocked_recv_count: self.data_blocked_recv_count,
             stream_data_blocked_recv_count: self.stream_data_blocked_recv_count,
+            streams_blocked_bidi_recv_count: self.streams_blocked_bidi_recv_count,
+            streams_blocked_uni_recv_count: self.streams_blocked_uni_recv_count,
             path_challenge_rx_count: self.path_challenge_rx_count,
             bytes_in_flight_duration: self.bytes_in_flight_duration(),
             tx_buffered_state: self.tx_buffered_state,
@@ -7791,6 +7982,10 @@ impl<F: BufFactory> Connection<F> {
                 self.flow_control.should_update_max_data() ||
                 self.should_send_max_data ||
                 self.blocked_limit.is_some() ||
+                self.streams_blocked_bidi_state
+                    .has_pending_stream_blocked_frame() ||
+                self.streams_blocked_uni_state
+                    .has_pending_stream_blocked_frame() ||
                 self.dgram_send_queue.has_pending() ||
                 self.local_error
                     .as_ref()
@@ -8234,12 +8429,18 @@ impl<F: BufFactory> Connection<F> {
                 if limit > MAX_STREAM_ID {
                     return Err(Error::InvalidFrame);
                 }
+
+                self.streams_blocked_bidi_recv_count =
+                    self.streams_blocked_bidi_recv_count.saturating_add(1);
             },
 
             frame::Frame::StreamsBlockedUni { limit } => {
                 if limit > MAX_STREAM_ID {
                     return Err(Error::InvalidFrame);
                 }
+
+                self.streams_blocked_uni_recv_count =
+                    self.streams_blocked_uni_recv_count.saturating_add(1);
             },
 
             frame::Frame::NewConnectionId {
@@ -8991,6 +9192,16 @@ pub struct Stats {
     /// The number of STREAM_DATA_BLOCKED frames received from the remote.
     pub stream_data_blocked_recv_count: u64,
 
+    /// The number of STREAMS_BLOCKED frames for bidirectional streams received
+    /// from the remote, indicating the peer is blocked on opening new
+    /// bidirectional streams.
+    pub streams_blocked_bidi_recv_count: u64,
+
+    /// The number of STREAMS_BLOCKED frames for unidirectional streams received
+    /// from the remote, indicating the peer is blocked on opening new
+    /// unidirectional streams.
+    pub streams_blocked_uni_recv_count: u64,
+
     /// The total number of PATH_CHALLENGE frames that were received.
     pub path_challenge_rx_count: u64,
 
@@ -9049,14 +9260,15 @@ pub use crate::transport_params::UnknownTransportParameter;
 pub use crate::transport_params::UnknownTransportParameterIterator;
 pub use crate::transport_params::UnknownTransportParameters;
 
-pub use crate::range_buf::BufFactory;
-pub use crate::range_buf::BufSplit;
+pub use crate::buffers::BufFactory;
+pub use crate::buffers::BufSplit;
 
 pub use crate::error::ConnectionError;
 pub use crate::error::Error;
 pub use crate::error::Result;
 pub use crate::error::WireErrorCode;
 
+mod buffers;
 mod cid;
 mod crypto;
 mod dgram;

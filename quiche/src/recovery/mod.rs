@@ -138,6 +138,7 @@ pub struct RecoveryConfig {
     pub max_pacing_rate: Option<u64>,
     pub initial_congestion_window_packets: usize,
     pub enable_relaxed_loss_threshold: bool,
+    pub enable_cubic_idle_restart_fix: bool,
 }
 
 impl RecoveryConfig {
@@ -154,6 +155,7 @@ impl RecoveryConfig {
             initial_congestion_window_packets: config
                 .initial_congestion_window_packets,
             enable_relaxed_loss_threshold: config.enable_relaxed_loss_threshold,
+            enable_cubic_idle_restart_fix: config.enable_cubic_idle_restart_fix,
         }
     }
 }
@@ -485,6 +487,7 @@ struct QlogMetrics {
     ack_rate: Option<u64>,
     lost_packets: Option<u64>,
     lost_bytes: Option<u64>,
+    pto_count: Option<u32>,
 }
 
 #[cfg(feature = "qlog")]
@@ -620,6 +623,15 @@ impl QlogMetrics {
             None
         };
 
+        let new_pto_count =
+            if latest.pto_count.is_some() && self.pto_count != latest.pto_count {
+                self.pto_count = latest.pto_count;
+                emit_event = true;
+                latest.pto_count.map(|v| v as u16)
+            } else {
+                None
+            };
+
         // Build ex_data for rate metrics
         let mut ex_data = CfExData::new();
         if self.delivery_rate != latest.delivery_rate {
@@ -676,6 +688,7 @@ impl QlogMetrics {
                     bytes_in_flight: new_bytes_in_flight,
                     ssthresh: new_ssthresh,
                     pacing_rate: new_pacing_rate,
+                    pto_count: new_pto_count,
                     ex_data: ex_data.into_inner(),
                     ..Default::default()
                 },

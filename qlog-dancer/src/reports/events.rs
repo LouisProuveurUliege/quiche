@@ -24,7 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use qlog::events::h3::Http3Frame;
+use qlog::events::http3::Http3Frame;
 use qlog::events::quic::AckedRanges;
 use qlog::events::quic::QuicFrame;
 use qlog::events::EventData;
@@ -72,7 +72,7 @@ macro_rules! printyo_json {
 
 #[derive(Debug, Default, Tabled)]
 struct PrintableEvent {
-    pub time: f32,
+    pub time: f64,
     pub category: String,
     #[tabled(rename = "Type")]
     pub ty: String,

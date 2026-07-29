@@ -44,8 +44,8 @@ pub(crate) static NOCC: CongestionControlOps = CongestionControlOps {
     congestion_event,
     checkpoint,
     rollback,
-    has_custom_pacing,
     debug_fmt,
+    #[cfg(feature="qlog")]
     state_str,
 };
 #[allow(unused_variables)]
@@ -75,10 +75,6 @@ fn congestion_event(
 fn checkpoint(r: &mut Congestion) {}
 #[allow(unused_variables)]
 fn rollback(r: &mut Congestion) -> bool { true }
-
-fn has_custom_pacing() -> bool {
-    false
-}
 
 #[cfg(feature = "qlog")]
 #[allow(unused_variables)]

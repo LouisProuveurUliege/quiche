@@ -396,12 +396,6 @@ impl QuicSettings {
         65536
     }
 
-    
-    #[inline]
-    fn default_initial_rtt() -> Duration {
-        Duration::from_millis(333)
-    }
-
     #[inline]
     fn default_initial_rtt() -> Duration {
         Duration::from_millis(333)

@@ -34,10 +34,9 @@ use std::fmt::Display;
 
 use log::error;
 use log::trace;
-use qlog::events::connectivity::TransportOwner;
 use qlog::events::http3::Http3Frame;
-use qlog::events::quic::AckedRanges;
 use qlog::events::quic::QuicFrame;
+use qlog::events::quic::TransportInitiator;
 use qlog::events::EventData;
 use qlog::events::RawInfo;
 
@@ -1097,30 +1096,32 @@ impl Datastore {
         }
 
         match &event.data {
-            EventData::TransportParametersSet(v) =>
+            EventData::QuicParametersSet(v) =>
                 self.consume_qlog_transport_parameters_set(v),
 
-            EventData::PacketReceived(v) =>
+            EventData::QuicPacketReceived(v) =>
                 self.consume_qlog_packet_received(v, ev_time, process_acks),
 
-            EventData::PacketSent(v) => self.consume_qlog_packet_sent(v, ev_time),
+            EventData::QuicPacketSent(v) =>
+                self.consume_qlog_packet_sent(v, ev_time),
 
-            EventData::DataMoved(v) => self.consume_qlog_data_moved(v, ev_time),
+            EventData::QuicStreamDataMoved(v) =>
+                self.consume_qlog_stream_data_moved(v, ev_time),
 
-            EventData::MetricsUpdated(v) =>
+            EventData::QuicMetricsUpdated(v) =>
                 self.consume_qlog_metrics_updated(v, ev_time),
 
-            EventData::CongestionStateUpdated(v) =>
+            EventData::QuicCongestionStateUpdated(v) =>
                 self.consume_qlog_congestion_state_updated(v, ev_time),
 
-            EventData::H3FrameCreated(v) => match self.vantage_point {
+            EventData::Http3FrameCreated(v) => match self.vantage_point {
                 VantagePoint::Client =>
                     self.consume_qlog_h3_frame_created_client(v, ev_time),
                 VantagePoint::Server =>
                     self.consume_qlog_h3_frame_created_server(v, ev_time),
             },
 
-            EventData::H3FrameParsed(v) => match self.vantage_point {
+            EventData::Http3FrameParsed(v) => match self.vantage_point {
                 VantagePoint::Client =>
                     self.consume_qlog_h3_frame_parsed_client(v, ev_time),
                 VantagePoint::Server =>
@@ -1175,10 +1176,10 @@ impl Datastore {
     }
 
     fn consume_qlog_transport_parameters_set(
-        &mut self, tp: &qlog::events::quic::TransportParametersSet,
+        &mut self, tp: &qlog::events::quic::ParametersSet,
     ) {
-        match tp.owner {
-            Some(TransportOwner::Local) => {
+        match tp.initiator {
+            Some(TransportInitiator::Local) => {
                 if let Some(max_data) = tp.initial_max_data {
                     self.sent_max_data.push((0.0, max_data));
                 }
@@ -1194,7 +1195,7 @@ impl Datastore {
                 }
             },
 
-            Some(TransportOwner::Remote) => {
+            Some(TransportInitiator::Remote) => {
                 if let Some(max_data) = tp.initial_max_data {
                     self.received_max_data.push((0.0, max_data));
                 }
@@ -1236,61 +1237,25 @@ impl Datastore {
                                 if let Some(pkt_space) =
                                     self.packet_sent.get_mut(&ty)
                                 {
-                                    match ack_ranges {
-                                        AckedRanges::Single(ranges) => {
-                                            // TODO: qlog deserializer seems to
-                                            // get confused (bug?) so work
-                                            // around it detecting single or
-                                            // pairs
-
-                                            for pkt_nums in ranges {
-                                                if pkt_nums.len() == 1 {
-                                                    if let Some(pkt) = pkt_space
-                                                        .get_mut(&pkt_nums[0])
-                                                    {
-                                                        pkt.acked = Some(true);
-                                                    }
-                                                } else if pkt_nums.len() == 2 {
-                                                    // TODO: check ack ranges and
-                                                    // rust
-                                                    // Range mapping is correct
-                                                    let actual_range = pkt_nums
-                                                        [0]..
-                                                        pkt_nums[1] + 1;
-
-                                                    pkt_space
-                                                        .range_mut(actual_range)
-                                                        .for_each(|e| {
-                                                            e.1.acked = Some(true)
-                                                        });
-                                                }
-                                            }
-                                        },
-                                        AckedRanges::Double(ranges) => {
-                                            for range in ranges {
-                                                // TODO: check ack ranges and rust
-                                                // Range mapping is correct
-                                                let actual_range =
-                                                    range.0..range.1 + 1;
-
-                                                pkt_space
-                                                    .range_mut(actual_range)
-                                                    .for_each(|e| {
-                                                        e.1.acked = Some(true)
-                                                    });
-                                            }
-                                        },
+                                    for range in ack_ranges {
+                                        // TODO: check ack ranges and rust
+                                        // Range mapping is correct
+                                        pkt_space
+                                            .range_mut(range.as_range_inclusive())
+                                            .for_each(|e| e.1.acked = Some(true));
                                     }
                                 }
                             }
                         }
                     },
 
-                    QuicFrame::MaxData { maximum } => {
+                    QuicFrame::MaxData { maximum, .. } => {
                         self.received_max_data.push((ev_time, *maximum));
                     },
 
-                    QuicFrame::MaxStreamData { stream_id, maximum } => {
+                    QuicFrame::MaxStreamData {
+                        stream_id, maximum, ..
+                    } => {
                         let init_val = if is_bidi(*stream_id) {
                             self.peer_init_max_stream_data_bidi_remote
                         } else {
@@ -1310,17 +1275,22 @@ impl Datastore {
 
                     QuicFrame::Stream {
                         stream_id,
-                        length,
                         offset,
+                        raw,
                         ..
                     } => {
+                        let length = raw
+                            .clone()
+                            .unwrap_or_default()
+                            .payload_length
+                            .unwrap_or_default();
                         let s = self
                             .received_stream_frames
                             .entry(*stream_id)
                             .or_default();
                         s.push((ev_time, StreamDatapoint {
-                            length: *length,
-                            offset: *offset,
+                            length,
+                            offset: offset.unwrap_or_default(),
                         }));
 
                         let s = self
@@ -1330,8 +1300,8 @@ impl Datastore {
                         s.push((
                             self.total_received_stream_frame_count,
                             StreamDatapoint {
-                                length: *length,
-                                offset: *offset,
+                                length,
+                                offset: offset.unwrap_or_default(),
                             },
                         ));
 
@@ -1378,11 +1348,13 @@ impl Datastore {
                         // TODO
                     },
 
-                    QuicFrame::MaxData { maximum } => {
+                    QuicFrame::MaxData { maximum, .. } => {
                         self.sent_max_data.push((event_time, *maximum));
                     },
 
-                    QuicFrame::MaxStreamData { stream_id, maximum } => {
+                    QuicFrame::MaxStreamData {
+                        stream_id, maximum, ..
+                    } => {
                         let init_val = if is_bidi(*stream_id) {
                             self.local_init_max_stream_data_bidi_local
                         } else {
@@ -1442,8 +1414,8 @@ impl Datastore {
         }
     }
 
-    fn consume_qlog_data_moved(
-        &mut self, dm: &qlog::events::quic::DataMoved, ev_time: f64,
+    fn consume_qlog_stream_data_moved(
+        &mut self, dm: &qlog::events::quic::StreamDataMoved, ev_time: f64,
     ) {
         if let Some(recipient) = &dm.to {
             let tracker = match recipient {
@@ -1457,19 +1429,22 @@ impl Datastore {
             };
 
             if let Some(stream_id) = dm.stream_id {
-                if let (Some(offset), Some(length)) = (dm.offset, dm.length) {
-                    tracker.update(
-                        stream_id,
-                        StreamAccess { offset, length },
-                        ev_time,
-                    );
+                if let Some(raw) = &dm.raw {
+                    if let (Some(offset), Some(length)) = (dm.offset, raw.length)
+                    {
+                        tracker.update(
+                            stream_id,
+                            StreamAccess { offset, length },
+                            ev_time,
+                        );
+                    }
                 }
             }
         }
     }
 
     fn consume_qlog_metrics_updated(
-        &mut self, mu: &qlog::events::quic::MetricsUpdated, ev_time: f64,
+        &mut self, mu: &qlog::events::quic::RecoveryMetricsUpdated, ev_time: f64,
     ) {
         if let Some(cwnd) = mu.congestion_window {
             self.local_cwnd.push((ev_time, cwnd));
@@ -1521,13 +1496,15 @@ impl Datastore {
     fn consume_qlog_congestion_state_updated(
         &mut self, csu: &qlog::events::quic::CongestionStateUpdated, ev_time: f64,
     ) {
-        // give this a virtual y-value of the last cwnd value recorded, we
-        // can choose to use it or not later.
-        self.congestion_state_updates.push((
-            ev_time,
-            self.local_cwnd.last().unwrap().1,
-            csu.new.clone(),
-        ));
+        if let Some(point) = self.local_cwnd.last() {
+            // give this a virtual y-value of the last cwnd value recorded, we
+            // can choose to use it or not later.
+            self.congestion_state_updates.push((
+                ev_time,
+                point.1,
+                csu.new.clone(),
+            ));
+        }
     }
 
     fn get_or_insert_http_req(&mut self, stream_id: u64) -> &mut HttpRequestStub {
@@ -1541,10 +1518,10 @@ impl Datastore {
     }
 
     fn consume_qlog_h3_frame_created_client(
-        &mut self, fc: &qlog::events::http3::H3FrameCreated, ev_time: f64,
+        &mut self, fc: &qlog::events::http3::FrameCreated, ev_time: f64,
     ) {
         match &fc.frame {
-            Http3Frame::Headers { headers } => {
+            Http3Frame::Headers { headers, .. } => {
                 let req = self.get_or_insert_http_req(fc.stream_id);
                 req.time_first_headers_tx.get_or_insert(ev_time);
                 req.set_request_info_from_qlog(headers);
@@ -1566,11 +1543,12 @@ impl Datastore {
             },
 
             Http3Frame::PriorityUpdate {
-                prioritized_element_id,
+                stream_id: Some(stream_id),
                 priority_field_value,
                 ..
             } => {
-                let req = self.get_or_insert_http_req(*prioritized_element_id);
+                let req: &mut HttpRequestStub =
+                    self.get_or_insert_http_req(*stream_id);
                 req.priority_updates.push(priority_field_value.clone());
             },
 
@@ -1580,10 +1558,10 @@ impl Datastore {
     }
 
     fn consume_qlog_h3_frame_created_server(
-        &mut self, fc: &qlog::events::http3::H3FrameCreated, ev_time: f64,
+        &mut self, fc: &qlog::events::http3::FrameCreated, ev_time: f64,
     ) {
         match &fc.frame {
-            Http3Frame::Headers { headers } => {
+            Http3Frame::Headers { headers, .. } => {
                 let req = self.get_or_insert_http_req(fc.stream_id);
                 req.time_first_headers_tx.get_or_insert(ev_time);
                 req.set_response_info_from_qlog(headers);
@@ -1610,10 +1588,10 @@ impl Datastore {
     }
 
     fn consume_qlog_h3_frame_parsed_client(
-        &mut self, fp: &qlog::events::http3::H3FrameParsed, ev_time: f64,
+        &mut self, fp: &qlog::events::http3::FrameParsed, ev_time: f64,
     ) {
         match &fp.frame {
-            Http3Frame::Headers { headers } => {
+            Http3Frame::Headers { headers, .. } => {
                 let req = self.get_or_insert_http_req(fp.stream_id);
                 req.time_first_headers_rx.get_or_insert(ev_time);
 
@@ -1647,10 +1625,10 @@ impl Datastore {
     }
 
     fn consume_qlog_h3_frame_parsed_server(
-        &mut self, fp: &qlog::events::http3::H3FrameParsed, ev_time: f64,
+        &mut self, fp: &qlog::events::http3::FrameParsed, ev_time: f64,
     ) {
         match &fp.frame {
-            Http3Frame::Headers { headers } => {
+            Http3Frame::Headers { headers, .. } => {
                 let req = self.get_or_insert_http_req(fp.stream_id);
                 req.time_first_headers_rx.get_or_insert(ev_time);
                 req.path = NaOption::new(find_header_value(headers, ":path"));
@@ -1674,11 +1652,11 @@ impl Datastore {
             },
 
             Http3Frame::PriorityUpdate {
-                prioritized_element_id,
+                stream_id: Some(stream_id),
                 priority_field_value,
                 ..
             } => {
-                let req = self.get_or_insert_http_req(*prioritized_element_id);
+                let req = self.get_or_insert_http_req(*stream_id);
                 req.priority_updates.push(priority_field_value.clone());
             },
 

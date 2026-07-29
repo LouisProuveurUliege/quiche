@@ -17,7 +17,7 @@ src/
     congestion/              Legacy CC (Cubic, Reno, Hystart++)
     gcongestion/             Google-derived CC (BBR2) — behind `gcongestion` feature
   stream/                    Stream state machine, flow control per-stream
-  tls/                       TLS backend abstraction (BoringSSL / OpenSSL)
+  tls/                       TLS backend abstraction (BoringSSL)
   crypto/                    Packet protection, key derivation
   packet.rs       (2.3k)     Packet parsing, ConnectionId, Header
   frame.rs                   QUIC frame encode/decode
@@ -28,18 +28,19 @@ src/
   transport_params.rs        QUIC transport parameter encode/decode
   flowcontrol.rs             Connection-level flow control
   ranges.rs                  ACK range tracking
-  range_buf.rs               BufFactory/BufSplit traits for zero-copy buffer creation
+  buffers.rs                 BufFactory/BufSplit/DefaultBufFactory traits and types
+  range_buf.rs               RangeBuf — ordered byte buffer for stream reassembly
   dgram.rs                   DATAGRAM frame support
   rand.rs                    Random number generation
   minmax.rs                  Windowed min/max filter
   test_utils.rs              Pipe struct for in-memory QUIC pairs (pub via `internal` feature)
   tests.rs        (12k)      Integration tests
-  build.rs                   BoringSSL cmake build (NOTE: lives in src/, not crate root)
+  build.rs                   Link directives + pkg-config metadata (NOTE: lives in src/, not crate root)
 include/
   quiche.h        (1.2k)     C API header — mirrors ffi.rs
-deps/
-  boringssl/                 Git submodule
 ```
+
+BoringSSL itself is built by `boring-sys` (no in-tree submodule).
 
 ## WHERE TO LOOK
 
@@ -52,7 +53,7 @@ deps/
 | TLS handshake | `tls/mod.rs` — cfg-gated per backend |
 | C bindings | `ffi.rs` + `include/quiche.h` |
 | Test harness | `test_utils.rs` (`Pipe` struct) |
-| Build system | `src/build.rs` — BoringSSL cmake, cross-compile params |
+| Build system | `src/build.rs` — link directives + pkg-config metadata (BoringSSL is built by `boring-sys`) |
 
 ## ANTI-PATTERNS
 
@@ -64,11 +65,11 @@ deps/
 
 ## NOTES
 
-- `build.rs` is at `src/build.rs` (Cargo.toml: `build = "src/build.rs"`), not crate root.
-- Three TLS backends: `boringssl-vendored` (default), `boringssl-boring-crate`, `openssl` — mutually exclusive features.
+- `build.rs` is at `src/build.rs` (Cargo.toml: `build = "src/build.rs"`), not crate root. Emits link directives and, with `pkg-config-meta`, writes `quiche.pc`; BoringSSL itself is built by `boring-sys`.
+- Single TLS backend: `boringssl-boring-crate` (default), via the `boring`/`boring-sys` crates.
 - `quiche::Error` is `Copy + Clone` — intentional for hot-path ergonomics.
 - `test_utils::Pipe` exposed via `internal` feature for downstream crate integration tests.
 - Tests use `rstest` with `#[values("cubic", "bbr2_gcongestion")]` parameterization for CC coverage.
-- `QUICHE_BSSL_PATH` env var skips vendored BoringSSL build.
+- `BORING_BSSL_PATH` env var (consumed by `boring-sys`) points at a custom BoringSSL source tree.
 - Crate-type: `lib` + `staticlib` + `cdylib` — the latter two for C consumers.
-- `BufFactory` trait (`range_buf.rs`) enables zero-copy buffer creation; `Connection<F>` is generic over it.
+- `BufFactory` trait (`buffers.rs`) enables zero-copy buffer creation; `Connection<F>` is generic over it.

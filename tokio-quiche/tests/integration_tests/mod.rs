@@ -44,6 +44,8 @@ pub mod async_callbacks;
 pub mod connection_close;
 pub mod headers;
 pub mod migration;
+pub mod qlog_compression;
+pub mod stream_limit;
 pub mod timeouts;
 pub mod zero_rtt;
 
@@ -97,6 +99,37 @@ async fn e2e_client_ip_validation_disabled() {
     quic_settings.max_send_udp_payload_size = 1400;
     quic_settings.max_idle_timeout = Some(Duration::from_secs(5));
     quic_settings.disable_client_ip_validation = true;
+
+    let hook = TestConnectionHook::new();
+
+    let (url, _) = start_server_with_settings(
+        quic_settings,
+        Http3Settings::default(),
+        hook.clone(),
+        handle_connection,
+    );
+    let url = format!("{url}/1");
+    let reqs = vec![request(url, 1)];
+
+    let res = try_join_all(reqs).await.unwrap();
+    let res_map = map_responses(res);
+
+    assert_eq!(res_map.len(), 1);
+
+    let resps = res_map.get(&1).unwrap();
+    assert_eq!(resps.len(), 1);
+    assert!(hook.was_called());
+}
+
+// Exercise the persistent per-connection egress buffer path, i.e. the IO
+// worker with `QuicSettings::pool_send_buffer` disabled. The default (pooling
+// enabled) path is covered by every other end-to-end test.
+#[tokio::test]
+async fn e2e_pooled_send_buffer_disabled() {
+    let mut quic_settings = QuicSettings::default();
+    quic_settings.max_recv_udp_payload_size = 1400;
+    quic_settings.max_send_udp_payload_size = 1400;
+    quic_settings.pool_send_buffer = false;
 
     let hook = TestConnectionHook::new();
 
@@ -200,6 +233,37 @@ async fn test_ioworker_state_machine_pause() {
         .expect("request failed");
 
     assert!(received_status_code_on_stream(&summary, 0, 200));
+}
+
+#[tokio::test]
+#[cfg(feature = "custom-client-dcid")]
+async fn test_connect_with_custom_dcid() {
+    use tokio_quiche::http3::settings::Http3Settings;
+    use tokio_quiche::quic::connect_with_config;
+    use tokio_quiche::socket::Socket;
+    use tokio_quiche::ClientH3Driver;
+    use tokio_quiche::ConnectionIdGenerator;
+
+    let (url, _hook, _audit_stats_rx) = start_server();
+    let addr = extract_host_ipv4(&url);
+
+    let tokio_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    tokio_socket.connect(addr).await.unwrap();
+    let socket = Socket::try_from(tokio_socket).unwrap();
+    let (h3_driver, _h3_controller) =
+        ClientH3Driver::new(Http3Settings::default());
+    let dcid =
+        tokio_quiche::quic::SimpleConnectionIdGenerator.new_connection_id();
+    let mut params = ConnectionParams::default();
+    params.dcid = Some(dcid);
+
+    assert!(timeout(
+        Duration::from_secs(5),
+        connect_with_config(socket, Some("127.0.0.1"), &params, h3_driver,),
+    )
+    .await
+    .expect("connection timed out")
+    .is_ok());
 }
 
 #[tokio::test]

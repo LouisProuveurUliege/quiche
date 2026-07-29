@@ -11,7 +11,7 @@ Cloudflare's QUIC and HTTP/3 implementation in Rust. Workspace of 11 crates: cor
 ## STRUCTURE
 
 ```
-quiche/                     # Core QUIC+H3 library (C FFI, BoringSSL submodule)
+quiche/                     # Core QUIC+H3 library (C FFI, BoringSSL via boring-sys)
 tokio-quiche/               # Async tokio wrapper (server/client drivers)
 apps/                       # CLI binaries: quiche-client, quiche-server
 h3i/                        # HTTP/3 interactive testing/debugging tool
@@ -19,8 +19,8 @@ qlog/                       # qlog event schema (RFC draft)
 qlog-dancer/                # qlog/netlog visualization (native + wasm)
 netlog/                     # Chrome netlog parser
 octets/                     # Zero-copy byte buffer primitives
-buffer-pool/                # Sharded lock-free buffer pool
-datagram-socket/            # UDP socket abstraction (sendmmsg/recvmmsg)
+buffer-pool/                # Sharded lock-free buffer pool (deprecated — no longer used by other workspace crates)
+datagram-socket/            # UDP socket abstraction (sendmmsg/recvmmsg) + zero-copy buffer for datagrams
 task-killswitch/            # Async task cancellation primitive
 fuzz/                       # Fuzz targets (excluded from workspace)
 tools/                      # Android build tooling, http3_test harness
@@ -29,10 +29,10 @@ tools/                      # Android build tooling, http3_test harness
 ## DEPENDENCY GRAPH
 
 ```
-octets  buffer-pool  task-killswitch  qlog  netlog    (Layer 0: no workspace deps)
-  |         |              |            |      |
-  v         v              |            v      v
-quiche  datagram-socket    |        qlog-dancer        (Layer 1)
+octets  task-killswitch  qlog  netlog  buffer-pool    (Layer 0: no workspace deps)
+  |           |            |      |     (no dependents)
+  v           |            v      v
+quiche  datagram-socket  qlog-dancer        (Layer 1)
   |   \     |              |
   v    \    v              v
   tokio-quiche  <----------+                           (Layer 2: depends on most)
@@ -48,7 +48,7 @@ quiche  datagram-socket    |        qlog-dancer        (Layer 1)
 | QUIC connection logic | `quiche/src/lib.rs` | 9k lines, core `Connection` struct |
 | HTTP/3 protocol | `quiche/src/h3/mod.rs` | Own `Error`/`Result` types |
 | Congestion control | `quiche/src/recovery/` | Two impls: `congestion/` (legacy) + `gcongestion/` (BBR2) |
-| TLS/crypto backends | `quiche/src/tls/`, `quiche/src/crypto/` | BoringSSL + OpenSSL, cfg-gated |
+| TLS/crypto backends | `quiche/src/tls/`, `quiche/src/crypto/` | BoringSSL only |
 | C FFI | `quiche/src/ffi.rs` + `quiche/include/quiche.h` | Behind `ffi` feature |
 | Async server/client | `tokio-quiche/src/` | `ApplicationOverQuic` trait is the extension point |
 | H3 async driver | `tokio-quiche/src/http3/driver/` | `DriverHooks` sealed trait, channels |
@@ -68,13 +68,14 @@ quiche  datagram-socket    |        qlog-dancer        (Layer 1)
 | `H3Driver<H>` | struct | `tokio-quiche/src/http3/driver/` | Generic H3 driver |
 | `IoWorker<Tx,M,S>` | struct | `tokio-quiche/src/quic/io/worker.rs` | Per-connection IO loop |
 | `Pipe` | struct | `quiche/src/test_utils.rs` | In-memory test connection pair |
-| `BufFactory` | trait | `quiche/src/range_buf.rs` | Zero-copy buffer creation |
+| `BufFactory` | trait | `quiche/src/buffers.rs` | Zero-copy buffer creation |
 | `Recovery` | enum | `quiche/src/recovery/mod.rs` | CC dispatch via enum_dispatch |
 | `RecoveryOps` | trait | `quiche/src/recovery/mod.rs` | 40+ method CC interface |
 
 ## CONVENTIONS
 
 - **Line width 82** (`rustfmt.toml`), comments 80. Nightly rustfmt required.
+- **MANDATORY: run `cargo +nightly fmt` after every code change, no exceptions** -- this includes trivial edits like renames, comment changes, or single-line fixes.
 - **One `use` per item** (`imports_granularity = "Item"`, vertical layout).
 - **`pub(crate)`** for cross-module internals; `pub` only for true public API.
 - **BSD-2-Clause copyright header** on every `.rs` file.
@@ -97,8 +98,9 @@ quiche  datagram-socket    |        qlog-dancer        (Layer 1)
 ## FEATURE FLAGS
 
 ```
-quiche:        default=boringssl-vendored | boringssl-boring-crate | openssl
-               qlog, gcongestion, internal, ffi, fuzzing, sfv, custom-client-dcid
+quiche:        default=boringssl-boring-crate
+               qlog, gcongestion, internal, ffi, fuzzing, sfv, custom-client-dcid,
+               pkg-config-meta
 tokio-quiche:  fuzzing, quiche_internal, gcongestion, zero-copy, rpk
                (hardcodes: quiche/boringssl-boring-crate + quiche/qlog)
 h3i:           async (enables tokio-quiche dependency)
@@ -108,12 +110,12 @@ h3i:           async (enables tokio-quiche dependency)
 
 ```bash
 # Dev
-cargo build                                           # build workspace (vendored BoringSSL)
+cargo build                                           # build workspace (boring-sys builds BoringSSL)
 cargo test --all-targets --features=async,ffi,qlog --workspace  # full test suite
 cargo test --doc --features=async,ffi,qlog --workspace          # doc tests (separate!)
 
 # Lint
-cargo clippy --features=boringssl-vendored --workspace -- -D warnings
+cargo clippy --features=async,ffi,qlog --workspace -- -D warnings
 cargo +nightly fmt -- --check                                  
 
 # Fuzz
@@ -125,10 +127,10 @@ make docker-build                                     # quiche-base + quiche-qns
 
 ## NOTES
 
-- **Git submodules required**: `git submodule update --init --recursive` for BoringSSL.
-- **MSRV 1.85**: `rust-version` field in Cargo.toml.
+- **No git submodules**: BoringSSL is built by `boring-sys`; `cmake` must be available.
+- **MSRV 1.88**: `rust-version` field in Cargo.toml.
 - **Doc tests are separate**: `cargo test --all-targets` does NOT run doc tests (cargo#6669).
-- **`QUICHE_BSSL_PATH`**: env var to skip vendored BoringSSL build (use pre-built).
+- **`BORING_BSSL_PATH`**: env var to point `boring-sys` at a custom BoringSSL source tree.
 - **`RUSTFLAGS="-D warnings"`**: CI enforces; all warnings are errors.
 - **Cargo.lock is gitignored** (library project).
 - **Dual CI**: GitHub Actions (real) + GitLab CI (no-op stub).

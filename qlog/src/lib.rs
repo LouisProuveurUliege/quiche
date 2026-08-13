@@ -481,6 +481,8 @@ pub struct QlogSeq {
     pub title: Option<String>,
     pub description: Option<String>,
 
+    pub qlog_format: Option<String>,
+    pub qlog_version: Option<String>,
     pub trace: TraceSeq,
 }
 

@@ -121,8 +121,6 @@ impl QlogStreamer {
             serialization_format: "JSON-SEQ".to_string(),
             title,
             description,
-            qlog_format: Some("JSON-SEQ".to_string()),
-            qlog_version: Some("0.3".to_string()),
             trace,
         };
 
